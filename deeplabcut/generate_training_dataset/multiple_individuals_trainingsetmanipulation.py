@@ -44,6 +44,7 @@ def create_multianimaltraining_dataset(
     windows2linux=False,
     net_type=None,
     numdigits=2,
+    check_connectivity=True
 ):
     """
     Creates a training dataset for multi-animal datasets. Labels from all the extracted frames are merged into a single .h5 file.\n
@@ -120,7 +121,8 @@ def create_multianimaltraining_dataset(
 
     # multianimal case:
     dataset_type = "multi-animal-imgaug"
-    partaffinityfield_graph = auxfun_multianimal.getpafgraph(cfg, printnames=False)
+    partaffinityfield_graph = auxfun_multianimal.getpafgraph(cfg, printnames=False,check_connectivity=check_connectivity)
+
     # ATTENTION: order has to be multibodyparts, then uniquebodyparts (for indexing)
     print("Utilizing the following graph:", partaffinityfield_graph)
     num_limbs = len(partaffinityfield_graph)

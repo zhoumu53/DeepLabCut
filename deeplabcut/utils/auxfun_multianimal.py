@@ -37,7 +37,7 @@ def IntersectionofIndividualsandOnesGivenbyUser(cfg, individuals):
         return [ind for ind in individuals if ind in all_indivs]
 
 
-def getpafgraph(cfg, printnames=True):
+def getpafgraph(cfg, printnames=True,check_connectivity=True):
     """ Auxiliary function that turns skeleton (list of connected bodypart pairs)
         into a list of corresponding indices (with regard to the stacked multianimal/uniquebodyparts)
 
@@ -69,7 +69,7 @@ def getpafgraph(cfg, printnames=True):
             print("Attention, parts do not exist!", link)
 
     unconnected = set(range(len(multianimalbodyparts))).difference(connected)
-    if unconnected and len(multianimalbodyparts)>1: #for single bpt not important!
+    if unconnected and len(multianimalbodyparts)>1 and check_connectivity: #for single bpt not important!
         raise ValueError(
             f'Unconnected {", ".join(multianimalbodyparts[i] for i  in unconnected)}. '
             f"For multi-animal projects, all multianimalbodyparts should be connected. "

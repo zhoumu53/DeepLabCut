@@ -831,6 +831,7 @@ def create_training_dataset(
     testIndices=None,
     net_type=None,
     augmenter_type=None,
+    check_connectivity=True
 ):
     """
     Creates a training dataset. Labels from all the extracted frames are merged into a single .h5 file.\n
@@ -872,6 +873,10 @@ def create_training_dataset(
     augmenter_type: string
         Type of augmenter. Currently default, imgaug, tensorpack, and deterministic are supported.
 
+    check_connectivity: bool
+        Only relevant for maDLC, if true checks if all multianimal bodyparts are connected. Otherwise stops. You might want
+        to turn this off, for tracking multiple different objects (that should not be connected).
+
     Example
     --------
     >>> deeplabcut.create_training_dataset('/analysis/project/reaching-task/config.yaml',num_shuffles=1)
@@ -889,7 +894,7 @@ def create_training_dataset(
         )
 
         create_multianimaltraining_dataset(
-            config, num_shuffles, Shuffles, windows2linux, net_type
+            config, num_shuffles, Shuffles, windows2linux, net_type,check_connectivity=check_connectivity
         )
     else:
         scorer = cfg["scorer"]
