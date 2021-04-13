@@ -22,6 +22,87 @@ from deeplabcut.utils import auxiliaryfunctions, visualization, frameselectionto
 from deeplabcut.utils.auxfun_videos import VideoWriter
 
 
+def _extract_outlier_frames(
+    config_file,
+    video_file,
+    h5_file,
+    n_frames=10,
+    outlier_algo="jump",
+    extraction_algo="kmeans",
+    kept_keypoints="all",
+    pcutoff=0.1,
+    epsilon=20,
+    ARdegree=3,
+    MAdegree=1,
+    alpha=0.01,
+):
+    if outlier_algo not in ("jump", "uncertain", "fitting"):
+        raise ValueError(f"Unsupported algorithm {outlier_algo}.")
+
+    if extraction_algo not in ("kmeans", "uniform"):
+        raise ValueError(f"Unknown algorithm {extraction_algo}.")
+
+    cfg = auxiliaryfunctions.read_config(config_file)
+    bodyparts = auxiliaryfunctions.IntersectionofBodyPartsandOnesGivenbyUser(
+        cfg, kept_keypoints
+    )
+    if not len(bodyparts):
+        raise ValueError("No valid bodyparts were selected.")
+
+    df = pd.read_hdf(h5_file)
+    nframes = len(df)
+    startindex = max([int(np.floor(nframes * cfg["start"])), 0])
+    stopindex = min([int(np.ceil(nframes * cfg["stop"])), nframes])
+    Index = np.arange(stopindex - startindex) + startindex
+
+    df = df.iloc[Index]
+    mask = df.columns.get_level_values("bodyparts").isin(bodyparts)
+    df_temp = df.loc[:, mask]
+    Indices = []
+    if outlier_algo == "uncertain":
+        p = df_temp.xs("likelihood", level=-1, axis=1)
+        ind = df_temp.index[(p < pcutoff).any(axis=1)].tolist()
+        Indices.extend(ind)
+    elif outlier_algo == "jump":
+        temp_dt = df_temp.diff(axis=0) ** 2
+        temp_dt.drop("likelihood", axis=1, level=-1, inplace=True)
+        sum_ = temp_dt.sum(axis=1, level=1)
+        ind = df_temp.index[(sum_ > epsilon ** 2).any(axis=1)].tolist()
+        Indices.extend(ind)
+    else:
+        d, o = compute_deviations(
+            df_temp, df, pcutoff, alpha, ARdegree, MAdegree
+        )
+        # Some heuristics for extracting frames based on distance:
+        ind = np.flatnonzero(
+            d > epsilon
+        )  # time points with at least average difference of epsilon
+        if (
+                len(ind) < n_frames * 2 < len(d)
+        ):  # if too few points qualify, extract the most distant ones.
+            ind = np.argsort(d)[::-1][: n_frames * 2]
+        Indices.extend(ind)
+
+    if not Indices:
+        print("No outlier frames were found.")
+        return
+
+    Indices = np.sort(list(set(Indices)))
+    print(f"{len(Indices)} outlier frames were found.")
+
+    ExtractFramesbasedonPreselection(
+        Indices,
+        extraction_algo,
+        df,
+        "",
+        video_file,
+        cfg,
+        config_file,
+        savelabeled=False,
+        output_dir=os.path.splitext(video_file)[0],
+    )
+
+
 def extract_outlier_frames(
     config,
     videos,
@@ -401,6 +482,7 @@ def ExtractFramesbasedonPreselection(
     cluster_resizewidth=30,
     cluster_color=False,
     savelabeled=True,
+    output_dir=None,
 ):
     from deeplabcut.create_project import add
 
@@ -411,11 +493,12 @@ def ExtractFramesbasedonPreselection(
 
     videofolder = str(Path(video).parents[0])
     vname = str(Path(video).stem)
-    tmpfolder = os.path.join(cfg["project_path"], "labeled-data", vname)
-    if os.path.isdir(tmpfolder):
+    if output_dir is None:
+        output_dir = os.path.join(cfg["project_path"], "labeled-data", vname)
+    if os.path.isdir(output_dir):
         print("Frames from video", vname, " already extracted (more will be added)!")
     else:
-        auxiliaryfunctions.attempttomakefolder(tmpfolder)
+        auxiliaryfunctions.attempttomakefolder(output_dir, recursive=True)
 
     nframes = len(Dataframe)
     print("Loading video...")
@@ -490,7 +573,7 @@ def ExtractFramesbasedonPreselection(
                 coords,
                 Dataframe,
                 bodyparts,
-                tmpfolder,
+                output_dir,
                 index,
                 cfg["dotsize"],
                 cfg["pcutoff"],
@@ -504,7 +587,7 @@ def ExtractFramesbasedonPreselection(
                 clip,
                 Dataframe,
                 bodyparts,
-                tmpfolder,
+                output_dir,
                 index,
                 cfg["dotsize"],
                 cfg["pcutoff"],
@@ -533,7 +616,7 @@ def ExtractFramesbasedonPreselection(
         ]  # exchange index number by file names.
 
         machinefile = os.path.join(
-            tmpfolder, "machinelabels-iter" + str(cfg["iteration"]) + ".h5"
+            output_dir, "machinelabels-iter" + str(cfg["iteration"]) + ".h5"
         )
         if Path(machinefile).is_file():
             Data = pd.read_hdf(machinefile, "df_with_missing")
@@ -543,11 +626,11 @@ def ExtractFramesbasedonPreselection(
 
             DataCombined.to_hdf(machinefile, key="df_with_missing", mode="w")
             DataCombined.to_csv(
-                os.path.join(tmpfolder, "machinelabels.csv")
+                os.path.join(output_dir, "machinelabels.csv")
             )  # this is always the most current one (as reading is from h5)
         else:
             DF.to_hdf(machinefile, key="df_with_missing", mode="w")
-            DF.to_csv(os.path.join(tmpfolder, "machinelabels.csv"))
+            DF.to_csv(os.path.join(output_dir, "machinelabels.csv"))
         try:
             if cfg["cropping"]:
                 add.add_new_videos(
