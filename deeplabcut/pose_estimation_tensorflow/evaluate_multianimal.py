@@ -10,6 +10,7 @@ Licensed under GNU Lesser General Public License v3.0
 
 
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +99,258 @@ def _calc_train_test_error(data, metadata, pcutoff=0.3):
     error_test = np.nanmean(dists_test[:, 0])
     error_test_cut = np.nanmean(dists_test[dists_test[:, 1] >= pcutoff, 0])
     return error_train, error_test, error_train_cut, error_test_cut
+
+
+def evaluate_network_simple(
+    config,
+    snapshot_path,
+    gpu_to_use=None,
+):
+    import tensorflow as tf
+    from deeplabcut.pose_estimation_tensorflow.nnet import predict
+    from deeplabcut.pose_estimation_tensorflow.nnet import (
+        predict_multianimal as predictma,
+    )
+    from deeplabcut.utils import auxiliaryfunctions, auxfun_multianimal
+
+    os.environ.pop("TF_CUDNN_USE_AUTOTUNE", None)  # was potentially set during training
+
+    tf.reset_default_graph()
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    if gpu_to_use is not None:  # gpu selection
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_to_use)
+
+    cfg = auxiliaryfunctions.read_config(config)
+
+    evaluationfolder = str(Path(snapshot_path).parents[1]).replace("dlc-models", "evaluation-results")
+    auxiliaryfunctions.attempttomakefolder(evaluationfolder, recursive=True)
+    trainingsetfolder = auxiliaryfunctions.GetTrainingSetFolder(cfg)
+    Data = pd.read_hdf(
+        os.path.join(
+            cfg["project_path"],
+            str(trainingsetfolder),
+            "CollectedData_" + cfg["scorer"] + ".h5",
+        ),
+        "df_with_missing",
+    )
+    # Handle data previously annotated on a different platform
+    sep = "/" if "/" in Data.index[0] else "\\"
+    if sep != os.path.sep:
+        Data.index = Data.index.str.replace(sep, os.path.sep)
+
+    all_bpts = np.asarray(
+        len(cfg["individuals"]) * cfg["multianimalbodyparts"] + cfg["uniquebodyparts"]
+    )
+
+    snapshot = os.path.splitext(snapshot_path)[0]
+    shuffle = int(re.search(r'shuffle(\d+)', snapshot).group(1))
+    train_frac = int(re.search(r'trainset(\d+)', snapshot).group(1))
+    train_iter = int(snapshot.split('-')[-1])
+    metadata_pickle = os.path.join(
+        trainingsetfolder,
+        f"Documentation_data-{cfg['Task']}_{train_frac}shuffle{shuffle}.pickle"
+    )
+
+    _, train_inds, test_inds, _ = auxiliaryfunctions.LoadMetadata(
+        os.path.join(cfg["project_path"], metadata_pickle)
+    )
+    model_folder = os.path.split(snapshot_path)[0]
+    pose_config_test = os.path.join(os.path.dirname(model_folder), "test", "pose_cfg.yaml")
+    dlc_cfg = load_config(pose_config_test)
+
+    # TODO: IMPLEMENT for different batch sizes?
+    dlc_cfg["batch_size"] = 1  # due to differently sized images!!!
+    joints = dlc_cfg["all_joints_names"]
+    dlc_cfg["init_weights"] = snapshot
+
+    if (
+        "resnet" in dlc_cfg["net_type"]
+    ):  # ABBREVIATE NETWORK NAMES -- esp. for mobilenet!
+        netname = dlc_cfg["net_type"].replace(" _", "")
+    elif "mobilenet" in dlc_cfg["net_type"]:  # mobilenet >> mobnet_100; mobnet_35 etc.
+        netname = "mobnet_" + str(int(float(dlc_cfg["net_type"].split("_")[-1]) * 100))
+    elif "efficientnet" in dlc_cfg["net_type"]:
+        netname = "effnet_" + dlc_cfg["net_type"].split("-")[1]
+    else:
+        raise ValueError(f"Unknown network type {dlc_cfg['net_type']}")
+
+    DLCscorer = f"DLC_{netname}_{cfg['Task']}{cfg['date']}shuffle{shuffle}_{train_iter}"
+    print(f"Running {DLCscorer}")
+
+    pickle_file = os.path.join(evaluationfolder, f"{DLCscorer}-_full.pickle")
+    if os.path.isfile(pickle_file):
+        print("Model already evaluated.")
+    else:
+        sess, inputs, outputs = predict.setup_pose_prediction(dlc_cfg)
+
+        PredicteData = {}
+        dist = np.full((len(Data), len(all_bpts)), np.nan)
+        conf = np.full_like(dist, np.nan)
+        distnorm = np.full(len(Data), np.nan)
+        print("Analyzing data...")
+        for imageindex, imagename in tqdm(enumerate(Data.index)):
+            image_path = os.path.join(cfg["project_path"], imagename)
+            image = io.imread(image_path)
+            if image.ndim == 2 or image.shape[-1] == 1:
+                image = skimage.color.gray2rgb(image)
+            frame = img_as_ubyte(image)
+
+            GT = Data.iloc[imageindex]
+            df = GT.unstack("coords").reindex(joints, level='bodyparts')
+
+            # Evaluate PAF edge lengths to calibrate `distnorm`
+            temp = GT.unstack("bodyparts")[joints]
+            xy = temp.values.reshape((-1, 2, temp.shape[1])).swapaxes(
+                1, 2
+            )
+            if dlc_cfg['partaffinityfield_predict']:
+                edges = xy[:, dlc_cfg["partaffinityfield_graph"]]
+                lengths = np.sum(
+                    (edges[:, :, 0] - edges[:, :, 1]) ** 2, axis=2
+                )
+                distnorm[imageindex] = np.nanmax(lengths)
+
+            # FIXME Is having an empty array vs nan really that necessary?!
+            groundtruthidentity = list(
+                df.index.get_level_values("individuals")
+                    .to_numpy()
+                    .reshape((-1, 1))
+            )
+            groundtruthcoordinates = list(df.values[:, np.newaxis])
+            for i, coords in enumerate(groundtruthcoordinates):
+                if np.isnan(coords).any():
+                    groundtruthcoordinates[i] = np.empty(
+                        (0, 2), dtype=float
+                    )
+                    groundtruthidentity[i] = np.array([], dtype=str)
+
+            PredicteData[imagename] = {}
+            PredicteData[imagename]["index"] = imageindex
+
+            pred = predictma.get_detectionswithcostsandGT(
+                frame,
+                groundtruthcoordinates,
+                dlc_cfg,
+                sess,
+                inputs,
+                outputs,
+                outall=False,
+                nms_radius=dlc_cfg['nmsradius'],
+                det_min_score=dlc_cfg['minconfidence'],
+            )
+            PredicteData[imagename]["prediction"] = pred
+            PredicteData[imagename]["groundtruth"] = [
+                groundtruthidentity,
+                groundtruthcoordinates,
+                GT,
+            ]
+
+            coords_pred = pred["coordinates"][0]
+            probs_pred = pred["confidence"]
+            for bpt, xy_gt in df.groupby(level="bodyparts"):
+                inds_gt = np.flatnonzero(
+                    np.all(~np.isnan(xy_gt), axis=1)
+                )
+                n_joint = joints.index(bpt)
+                xy = coords_pred[n_joint]
+                if inds_gt.size and xy.size:
+                    # Pick the predictions closest to ground truth,
+                    # rather than the ones the model has most confident in
+                    d = cdist(xy_gt.iloc[inds_gt], xy)
+                    rows, cols = linear_sum_assignment(d)
+                    min_dists = d[rows, cols]
+                    inds = np.flatnonzero(all_bpts == bpt)
+                    sl = imageindex, inds[inds_gt[rows]]
+                    dist[sl] = min_dists
+                    conf[sl] = probs_pred[n_joint][cols].squeeze()
+
+        sess.close()
+
+        # Compute all distance statistics
+        df_dist = pd.DataFrame(dist, columns=df.index)
+        df_conf = pd.DataFrame(conf, columns=df.index)
+        df_joint = pd.concat(
+            [df_dist, df_conf],
+            keys=["rmse", "conf"],
+            names=["metrics"],
+            axis=1
+        )
+        df_joint = df_joint.reorder_levels(
+            list(np.roll(df_joint.columns.names, -1)), axis=1
+        )
+        df_joint.sort_index(
+            axis=1,
+            level=["individuals", "bodyparts"],
+            ascending=[True, True],
+            inplace=True
+        )
+        write_path = os.path.join(evaluationfolder, f"dist_{train_iter}.csv")
+        df_joint.to_csv(write_path)
+
+        # Calculate overall prediction error
+        error = df_joint.xs("rmse", level="metrics", axis=1)
+        mask = df_joint.xs("conf", level="metrics", axis=1) >= cfg["pcutoff"]
+        error_masked = error[mask]
+        error_train = np.nanmean(error.iloc[train_inds])
+        error_train_cut = np.nanmean(error_masked.iloc[train_inds])
+        error_test = np.nanmean(error.iloc[test_inds])
+        error_test_cut = np.nanmean(error_masked.iloc[test_inds])
+        results = [
+            train_iter,
+            int(100 * train_frac),
+            shuffle,
+            np.round(error_train, 2),
+            np.round(error_test, 2),
+            cfg["pcutoff"],
+            np.round(error_train_cut, 2),
+            np.round(error_test_cut, 2),
+        ]
+
+        make_results_file([results], evaluationfolder, DLCscorer)
+
+        string = "Results for {} training iterations: {}, shuffle {}:\n" \
+                 "Train error: {} pixels. Test error: {} pixels.\n" \
+                 "With pcutoff of {}:\n" \
+                 "Train error: {} pixels. Test error: {} pixels."
+        print(string.format(*results))
+
+        print("##########################################")
+        print("Average Euclidean distance to GT per individual (in pixels)")
+        print(error_masked.groupby('individuals', axis=1).mean().mean().to_string())
+        print("Average Euclidean distance to GT per bodypart (in pixels)")
+        print(error_masked.groupby('bodyparts', axis=1).mean().mean().to_string())
+
+        # For OKS/PCK, compute the standard deviation error across all frames
+        sd = df_dist.groupby("bodyparts", axis=1).mean().std(axis=0)
+        sd["distnorm"] = np.sqrt(np.nanmax(distnorm))
+        sd.to_csv(write_path.replace("dist_", "sd_"))
+
+        PredicteData["metadata"] = {
+            "nms radius": dlc_cfg['nmsradius'],
+            "minimal confidence": dlc_cfg['minconfidence'],
+            "PAFgraph": dlc_cfg['partaffinityfield_graph'],
+            "all_joints": [[i] for i in range(len(dlc_cfg['all_joints']))],
+            "all_joints_names": [
+                dlc_cfg['all_joints_names'][i]
+                for i in range(len(dlc_cfg['all_joints']))
+            ],
+            "stride": dlc_cfg.get("stride", 8),
+        }
+        print(f"Done and results stored for snapshot: {train_iter}")
+
+        dictionary = {
+            "Scorer": DLCscorer,
+            "DLC-model-config file": dlc_cfg,
+            "trainIndices": train_inds,
+            "testIndices": test_inds,
+            "trainFraction": train_frac,
+        }
+        metadata = {"data": dictionary}
+        _ = auxfun_multianimal.SaveFullMultiAnimalData(
+            PredicteData, metadata, pickle_file.replace("_full.pickle", ".h5")
+        )
+
+        tf.reset_default_graph()
 
 
 def evaluate_multianimal_full(
