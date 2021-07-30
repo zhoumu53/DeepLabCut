@@ -249,9 +249,9 @@ Follow prompts!
 
 Given this is a totally fresh install, here are a few things that I also needed: `sudo apt install libcanberra-gtk-module libcanberra-gtk3-module` Then I proceeded below:
 
-I grab the conda file from the website at www.deeplabcut.org. Simply click to download (DLC-GPU). For me, this goes into Downloads.
+I grab the conda file from the website at www.deeplabcut.org. Simply click to download. For me, this goes into Downloads.
 
-So, I open a terminal, `cd Downloads`, and then run: `conda env create -f DLC-GPU.yaml`
+So, I open a terminal, `cd Downloads`, and then run: `conda env create -f DEEPLABCUT.yaml`
 
 Follow prompts!
 
@@ -265,7 +265,7 @@ failed
 CondaEnvException: Pip failed
 ```
 
-remove conda env: `conda remove --name DLC-GPU --all`, open the DLC-GPU.yaml file (any text editor!) and change `deeplabcut[gui]` to `deeplabcut`. Then run: `conda env create -f DLC-GPU.yaml` again...
+remove conda env: `conda remove --name DEEPLABCUT --all`, open the DLC-GPU.yaml file (any text editor!) and change `deeplabcut[gui]` to `deeplabcut`. Then run: `conda env create -f DEEPLABCUT.yaml` again...
 
 then you will get:
 ```python
@@ -277,13 +277,47 @@ done
 #
 # To activate this environment, use
 #
-#     $ conda activate DLC-GPU
+#     $ conda activate DEEPLABCUT
 #
 # To deactivate an active environment, use
 #
 #     $ conda deactivate
 ```
 
-Activate! `conda activate DLC-GPU` and then run: `conda install -c conda-forge wxpython` ... after this finishes, run: `pip install deeplabcut[gui]`
+Activate! `conda activate DEEPLABCUT` and then run: `conda install -c conda-forge wxpython` ... after this finishes, run: `pip install deeplabcut[gui]`
 
 Now you might get some warnings, but for me it was then totally fine to run `python -m deeplabcut` which launches the DLC GUI!
+
+
+
+## DeepLabCut M1 chip installation environment instructions:
+
+This only assumes you have anaconda installed!
+
+Use the `DEEPLABCUT_M1.yaml` conda file if you have an Macbok with an M1 chip, and follow these steps:
+
+(1) git clone the deeplabcut cut repo:
+
+`git clone https://github.com/DeepLabCut/DeepLabCut.git`
+
+(2) in the program terminal, `cd DeepLabCut/conda-environments`
+
+(3) Click here to download the Rosetta wheel for TensorFlow.
+
+For instance, for 2.4.1:
+https://drive.google.com/file/d/17pSwfoNuyf3YR8vCaVggHeI-pMQ3xL7l/view?usp=sharing
+(for different versions see here: https://github.com/tensorflow/tensorflow/issues/46044)
+
+(4) Then, run:
+
+`conda env create -f DEEPLABCUT_M1.yaml`
+
+(5) Next, **activate the environment,** and in the terminal `cd` to  Downloads, and then run:
+
+`pip install tensorflow-2.4.1-py3-none-any.whl --no-dependencies --force-reinstall`
+
+(6) Next, launch DLC with `pythonw -m deeplabcut`
+
+GUI will open!
+
+Note: Based on issue #1380 thanks!
