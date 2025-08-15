@@ -30,6 +30,12 @@ from deeplabcut.pose_estimation_pytorch.apis.utils import (
     list_videos_in_folder,
 )
 
+from deeplabcut.core.trackers.utils import DetectionResultsConverter
+# from deeplabcut.core.trackers.byte_tracker import BYTETracker
+from byteTrack.trackers.byte_tracker import BYTETracker
+
+from types import SimpleNamespace
+
 
 def convert_detections2tracklets(
     config: str,
@@ -46,7 +52,7 @@ def convert_detections2tracklets(
     calibrate: bool = False,  # TODO(niels): implement assembly calibration during video analysis
     window_size: int = 0,  # TODO(niels): implement window size selection for assembly during video analysis
     identity_only=False,
-    track_method="",
+    track_method="",  ### why we need this? we call auxfun_multianimal.get_track_method in the function
 ):
     """TODO: Documentation, clean & remove code duplication (with analyze video)"""
     cfg = auxiliaryfunctions.read_config(config)
@@ -134,6 +140,8 @@ def convert_detections2tracklets(
             method = "el"
         elif track_method == "box":
             method = "bx"
+        elif track_method == "byteTrack":
+            method = "bx_byteTrack"
         else:
             method = "sk"
 
@@ -143,39 +151,94 @@ def convert_detections2tracklets(
             print(f"Tracklets already computed at {track_filename}")
             print("Set overwrite = True to overwrite.")
         else:
-            assemblies_path = data_filename.with_stem(
-                data_filename.stem + "_assemblies"
-            ).with_suffix(".pickle")
-            if not assemblies_path.exists():
-                raise FileNotFoundError(
-                    f"Could not find the assembles file {assemblies_path}. You're "
-                    f"converting detections to tracklets using PyTorch, which "
-                    "means the assemblies file must be created by the model when "
-                    "analyzing the video!"
+            if track_method != "byteTrack":
+                assemblies_path = data_filename.with_stem(
+                    data_filename.stem + "_assemblies"
+                ).with_suffix(".pickle")
+                if not assemblies_path.exists():
+                    raise FileNotFoundError(
+                        f"Could not find the assembles file {assemblies_path}. You're "
+                        f"converting detections to tracklets using PyTorch, which "
+                        "means the assemblies file must be created by the model when "
+                        "analyzing the video!"
+                    )
+                assemblies_data = auxiliaryfunctions.read_pickle(assemblies_path)
+                
+                tracklets = build_tracklets(
+                    assemblies_data=assemblies_data,
+                    track_method=track_method,
+                    inference_cfg=inference_cfg,
+                    joints=data["metadata"]["all_joints_names"],
+                    scorer=metadata["data"]["Scorer"],
+                    num_frames=data["metadata"]["nframes"],
+                    ignore_bodyparts=ignore_bodyparts,
+                    unique_bodyparts=cfg["uniquebodyparts"],
+                    identity_only=identity_only
                 )
-            assemblies_data = auxiliaryfunctions.read_pickle(assemblies_path)
 
-            tracklets = build_tracklets(
-                assemblies_data=assemblies_data,
-                track_method=track_method,
-                inference_cfg=inference_cfg,
-                joints=data["metadata"]["all_joints_names"],
-                scorer=metadata["data"]["Scorer"],
-                num_frames=data["metadata"]["nframes"],
-                ignore_bodyparts=ignore_bodyparts,
-                unique_bodyparts=cfg["uniquebodyparts"],
-                identity_only=identity_only
-            )
+                with open(track_filename, "wb") as f:
+                    pickle.dump(tracklets, f, pickle.HIGHEST_PROTOCOL)
+            else:
+                ### if track_method == "byteTrack"
+                ### we need to read the video and convert the detections to tracklets (full videos)
+                
+                detections_path = data_filename.with_stem(
+                    data_filename.stem + "_full"
+                ).with_suffix(".pickle")
+                if not detections_path.exists():
+                    raise FileNotFoundError(
+                        f"Could not find the detection file {detections_path}. You're "
+                        f"converting detections to tracklets using PyTorch, which "
+                        "means the detection file must be created by the model when "
+                        "analyzing the video!"
+                    )
+                print("detections_path", detections_path)
+                detections_data = auxiliaryfunctions.read_pickle(detections_path)
+                print("detections_data['frame00']['bboxes']", detections_data['frame00']['bboxes'])
 
-            with open(track_filename, "wb") as f:
-                pickle.dump(tracklets, f, pickle.HIGHEST_PROTOCOL)
+                ### TODO - make this configurable
+                tracker_args = SimpleNamespace(
+                    track_high_thresh=0.75,      # High confidence threshold
+                    track_low_thresh=0.2,       # Low confidence threshold  
+                    track_buffer=30,            # Number of frames to keep lost tracks
+                    match_thresh=0.9,           # Matching threshold for association
+                    new_track_thresh=0.5,       # Threshold for creating new tracks
+                    fuse_score=True,             # Whether to fuse detection scores in distance calculation
+                    fps = 30,
+                )
+                tracker = BYTETracker(tracker_args, frame_rate=tracker_args.fps)
+                                
+                ## TODO - formatting tracklets into the same format as the other tracklets
+                tracklets = track_by_detections(
+                    detections_data=detections_data,
+                    tracker=tracker,
+                    num_frames=data["metadata"]["nframes"],
+                    video_path=video,
+                    visualize=True,
+                    output_path=track_filename.with_suffix(".mp4"),
+                    # inference_cfg=inference_cfg,
+                    # joints=data["metadata"]["all_joints_names"],
+                    # scorer=metadata["data"]["Scorer"],
+                    # num_frames=data["metadata"]["nframes"],
+                    # ignore_bodyparts=ignore_bodyparts,
+                    # unique_bodyparts=cfg["uniquebodyparts"],
+                    # identity_only=identity_only,
+                )
+                
+                with open(track_filename, "wb") as f:
+                    pickle.dump(tracklets, f, pickle.HIGHEST_PROTOCOL)
+                print("saved to", track_filename)
+                
 
     os.chdir(str(start_path))
-    print(
-        "The tracklets were created (i.e., under the hood "
-        "deeplabcut.convert_detections2tracklets was run). Now you can "
-        "'refine_tracklets' in the GUI, or run 'deeplabcut.stitch_tracklets'."
-    )
+    if track_method == "byteTrack":
+        return
+    else:
+        print(
+            "The tracklets were created (i.e., under the hood "
+            "deeplabcut.convert_detections2tracklets was run). Now you can "
+            "'refine_tracklets' in the GUI, or run 'deeplabcut.stitch_tracklets'."
+        )
 
 
 def build_tracklets(
@@ -327,3 +390,88 @@ def _conv_predictions_to_assemblies(
             assemblies[image_index] = kpt_lst
 
     return assemblies
+
+
+def track_by_detections(
+    detections_data: dict,
+    tracker: BYTETracker,
+    num_frames: int,
+    # ignore_bodyparts: list[str]|None = None,
+    # unique_bodyparts: list|None = None,
+    # identity_only: bool = False,
+    output_path: str = None,
+    fps: int = 30,
+    video_path: str = None,
+):
+    
+    
+    def extract_frame_results(data, frame_number, num_frames):
+        n_d = len(str(num_frames))
+        results = data[f'frame{frame_number:0{n_d}d}']
+        print("results", results['bboxes'])
+        bboxes = results['bboxes']
+        bbox_scores = results['bbox_scores']
+        poses = results['coordinates']
+        pose_scores = results['confidence']
+        return bboxes, bbox_scores, poses, pose_scores
+
+    DEBUG_visualize = True
+    if DEBUG_visualize:
+        import decord
+        import cv2
+        import imageio
+        
+        vr = decord.VideoReader(str(video_path))
+        # Get first frame to determine video dimensions
+        first_frame = vr[0].asnumpy()
+        height, width = first_frame.shape[:2]
+        # Setup video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    frames = []
+    all_tracked_results = {}
+    
+    num_frames = 100 if len(detections_data) >= 100 else len(detections_data) ## DEBUG --- remove this
+    for frame_num in range(0, num_frames):
+        # Extract detection results for current frame
+        bboxes, bbox_scores, poses, pose_scores = extract_frame_results(detections_data, frame_num, num_frames)
+        
+        print("bboxes", bboxes)
+        # Convert to tracker format
+        results = DetectionResultsConverter(bboxes, bbox_scores, poses, pose_scores)
+        
+        img = vr[frame_num].asnumpy() if vr is not None else None
+
+        # Update tracker with current frame detections
+        tracked_objects = tracker.update(results, img=img)
+                
+        if DEBUG_visualize:
+            # Visualize the results
+            from byteTrack.trackers.dlc_converter import visualize_tracking
+            
+            vis_image = visualize_tracking(img, tracked_objects, results)
+            # Add frame number to image
+            cv2.putText(vis_image, f'Frame: {frame_num} (ByteTrack)', (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+            # Write frame to video
+            frames.append(vis_image)
+            
+            if frame_num == 0:
+                cv2.imwrite(str(output_path).replace('.mp4', f'_{frame_num}.png'), vis_image)
+                print("saved to", str(output_path).replace('.mp4', f'_{frame_num}.png'))
+            
+            out.write(vis_image)
+            
+        # Store results
+        all_tracked_results[frame_num] = tracked_objects
+        
+        print(f"Frame {frame_num}: {len(tracked_objects)} tracked objects")
+    
+    if DEBUG_visualize:
+        out.release()
+        imageio.mimsave(str(output_path).replace('.mp4', '.gif'), frames, fps=fps)
+    
+    return all_tracked_results
+    

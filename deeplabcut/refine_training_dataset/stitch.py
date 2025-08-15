@@ -1152,7 +1152,14 @@ def stitch_tracklets(
             "CTD tracking occurs directly during video analysis. No need to call "
             "`stitch_tracklets` with `track_method=='ctd'`."
         )
-
+        
+    if track_method == "byteTrack":
+        print(
+            "ByteTrack tracking occurs directly during analyze_videos() or convert_detections2tracklets(). No need to call "
+            "`stitch_tracklets` with `track_method=='byteTrack'`."
+        )
+        return
+        
     if animal_names is None:
         animal_names = cfg["individuals"]
     elif n_tracks is not None and n_tracks != len(animal_names):
