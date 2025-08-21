@@ -31,8 +31,8 @@ from deeplabcut.pose_estimation_pytorch.apis.utils import (
 )
 
 from deeplabcut.core.trackers.utils import DetectionResultsConverter
-# from deeplabcut.core.trackers.byte_tracker import BYTETracker
-from byteTrack.trackers.byte_tracker import BYTETracker
+from deeplabcut.core.trackers.byte_tracker import BYTETracker
+# from byteTrack.trackers.byte_tracker import BYTETracker
 
 from types import SimpleNamespace
 
@@ -192,9 +192,7 @@ def convert_detections2tracklets(
                         "means the detection file must be created by the model when "
                         "analyzing the video!"
                     )
-                print("detections_path", detections_path)
                 detections_data = auxiliaryfunctions.read_pickle(detections_path)
-                print("detections_data['frame00']['bboxes']", detections_data['frame00']['bboxes'])
 
                 ### TODO - make this configurable
                 tracker_args = SimpleNamespace(
@@ -207,6 +205,9 @@ def convert_detections2tracklets(
                     fps = 30,
                 )
                 tracker = BYTETracker(tracker_args, frame_rate=tracker_args.fps)
+                
+                ### format the detections_data (ori: keys: metadata, frame00, ... -> keys: 0, 1, ...)
+                detections_data = {int(k.replace('frame', '')): v for k, v in detections_data.items() if k != 'metadata'}
                                 
                 ## TODO - formatting tracklets into the same format as the other tracklets
                 tracklets = track_by_detections(
@@ -214,19 +215,13 @@ def convert_detections2tracklets(
                     tracker=tracker,
                     num_frames=data["metadata"]["nframes"],
                     video_path=video,
-                    visualize=True,
                     output_path=track_filename.with_suffix(".mp4"),
-                    # inference_cfg=inference_cfg,
-                    # joints=data["metadata"]["all_joints_names"],
-                    # scorer=metadata["data"]["Scorer"],
-                    # num_frames=data["metadata"]["nframes"],
-                    # ignore_bodyparts=ignore_bodyparts,
-                    # unique_bodyparts=cfg["uniquebodyparts"],
-                    # identity_only=identity_only,
+                    fps=tracker_args.fps,
                 )
                 
                 with open(track_filename, "wb") as f:
                     pickle.dump(tracklets, f, pickle.HIGHEST_PROTOCOL)
+                ## TODO: format the tracklets + save to h5 file
                 print("saved to", track_filename)
                 
 
@@ -405,10 +400,8 @@ def track_by_detections(
 ):
     
     
-    def extract_frame_results(data, frame_number, num_frames):
-        n_d = len(str(num_frames))
-        results = data[f'frame{frame_number:0{n_d}d}']
-        print("results", results['bboxes'])
+    def extract_frame_results(data, frame_number):
+        results = data[frame_number]
         bboxes = results['bboxes']
         bbox_scores = results['bbox_scores']
         poses = results['coordinates']
@@ -432,12 +425,11 @@ def track_by_detections(
     frames = []
     all_tracked_results = {}
     
-    num_frames = 100 if len(detections_data) >= 100 else len(detections_data) ## DEBUG --- remove this
+    num_frames = len(detections_data)
     for frame_num in range(0, num_frames):
         # Extract detection results for current frame
-        bboxes, bbox_scores, poses, pose_scores = extract_frame_results(detections_data, frame_num, num_frames)
-        
-        print("bboxes", bboxes)
+        bboxes, bbox_scores, poses, pose_scores = extract_frame_results(detections_data, frame_num)
+
         # Convert to tracker format
         results = DetectionResultsConverter(bboxes, bbox_scores, poses, pose_scores)
         

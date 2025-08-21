@@ -9,13 +9,7 @@ import scipy
 # import lap
 from scipy.spatial.distance import cdist
 
-# from cython_bbox import bbox_overlaps as bbox_ious
 import deeplabcut.core.trackers.kalman_filter as kalman_filter
-# import decord
-
-# def read_video(path):
-#     vr = decord.VideoReader(path)
-#     return vr
 
 class DetectionResultsConverter:
     def __init__(self, bboxes, scores, poses, pose_scores, classes=None):
@@ -182,32 +176,13 @@ def iou_distance(atracks, btracks):
         atlbrs = atracks
         btlbrs = btracks
     else:
-        atlbrs = [track.xyxy for track in atracks]
-        btlbrs = [track.xyxy for track in btracks]
+        atlbrs = [track.tlbr for track in atracks]
+        btlbrs = [track.tlbr for track in btracks]
     _ious = ious(atlbrs, btlbrs)
     cost_matrix = 1 - _ious
 
     return cost_matrix
 
-def v_iou_distance(atracks, btracks):
-    """
-    Compute cost based on IoU
-    :type atracks: list[STrack]
-    :type btracks: list[STrack]
-
-    :rtype cost_matrix np.ndarray
-    """
-
-    if (len(atracks)>0 and isinstance(atracks[0], np.ndarray)) or (len(btracks) > 0 and isinstance(btracks[0], np.ndarray)):
-        atlbrs = atracks
-        btlbrs = btracks
-    else:
-        atlbrs = [track.tlwh_to_tlbr(track.pred_bbox) for track in atracks]
-        btlbrs = [track.tlwh_to_tlbr(track.pred_bbox) for track in btracks]
-    _ious = ious(atlbrs, btlbrs)
-    cost_matrix = 1 - _ious
-
-    return cost_matrix
 
 def embedding_distance(tracks, detections, metric='cosine'):
     """
