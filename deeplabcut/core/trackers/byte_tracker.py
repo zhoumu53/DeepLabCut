@@ -179,20 +179,6 @@ class BYTETracker(object):
         scores = output_results.conf
         bboxes = output_results.xywhr if hasattr(output_results, "xywhr") else output_results.xywh
         bboxes_tlwh = output_results.tlwh
-        # Add index
-        bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
-        cls = output_results.cls
-
-        # if output_results.shape[1] == 5:
-        #     scores = output_results[:, 4]
-        #     bboxes = output_results[:, :4]
-        # else:
-        #     output_results = output_results.cpu().numpy()
-        #     scores = output_results[:, 4] * output_results[:, 5]
-        #     bboxes = output_results[:, :4]  # x1y1x2y2
-        # img_h, img_w = img_info[0], img_info[1]
-        # scale = min(img_size[0] / float(img_h), img_size[1] / float(img_w))
-        # bboxes /= scale
 
         remain_inds = scores >= self.args.track_high_thresh
         inds_low = scores > self.args.track_low_thresh
@@ -243,8 +229,8 @@ class BYTETracker(object):
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets_second, scores_second)]
+            detections_second = [STrack(tlwh, s) for
+                          (tlwh, s) in zip(dets_second, scores_second)]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]

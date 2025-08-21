@@ -193,7 +193,10 @@ def convert_detections2tracklets(
                         "analyzing the video!"
                     )
                 detections_data = auxiliaryfunctions.read_pickle(detections_path)
-
+                ### format the detections_data (ori: keys: metadata, frame00, ... -> keys: 0, 1, ...)
+                detections_data = {int(k.replace('frame', '')): v for k, v in detections_data.items() if k != 'metadata'}
+                n_individuals = len(detections_data[0]['coordinates'][0])
+                            
                 ### TODO - make this configurable
                 tracker_args = SimpleNamespace(
                     track_high_thresh=0.75,      # High confidence threshold
@@ -203,12 +206,10 @@ def convert_detections2tracklets(
                     new_track_thresh=0.5,       # Threshold for creating new tracks
                     fuse_score=True,             # Whether to fuse detection scores in distance calculation
                     fps = 30,
+                    n_individuals=n_individuals,
                 )
                 tracker = BYTETracker(tracker_args, frame_rate=tracker_args.fps)
-                
-                ### format the detections_data (ori: keys: metadata, frame00, ... -> keys: 0, 1, ...)
-                detections_data = {int(k.replace('frame', '')): v for k, v in detections_data.items() if k != 'metadata'}
-                                
+                    
                 ## TODO - formatting tracklets into the same format as the other tracklets
                 tracklets = track_by_detections(
                     detections_data=detections_data,
@@ -402,8 +403,8 @@ def track_by_detections(
     
     def extract_frame_results(data, frame_number):
         results = data[frame_number]
-        bboxes = results['bboxes']
-        bbox_scores = results['bbox_scores']
+        bboxes = results['bboxes'] if 'bboxes' in results else None
+        bbox_scores = results['bbox_scores'] if 'bbox_scores' in results else None
         poses = results['coordinates']
         pose_scores = results['confidence']
         return bboxes, bbox_scores, poses, pose_scores
