@@ -18,7 +18,7 @@ def xywh2tlwh(x):
         x (np.ndarray | torch.Tensor): Input bounding box coordinates in xywh format.
 
     Returns:
-        (np.ndarray | torch.Tensor): Bounding box coordinates in xyltwh format.
+        (np.ndarray | torch.Tensor): Bounding box coordinates in tlwh format.
     """
     y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
     y[..., 0] = x[..., 0] - x[..., 2] / 2  # top left x
@@ -168,6 +168,19 @@ class BYTETracker(object):
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilter()
+        
+        ## new: fixed-id tracking
+        self.K = int(args.n_individuals)
+        self.fixed_ids = list(range(1, self.K+1))
+        self.available_ids = self.fixed_ids.copy()
+        self.full_init = False
+
+        self.revive_enable = getattr(args, "revive_enable", True)
+        self.revive_iou_thresh = getattr(args, "revive_iou_thresh", 0.7)  # cost <= 0.7 -> IoU >= 0.3
+        self.revive_maha_gate = getattr(args, "revive_maha_gate", 16.27)  # looser than 9.21
+        self.revive_max_gap = getattr(args, "revive_max_gap", self.max_time_lost)
+        self.revive_use_pose = getattr(args, "revive_use_pose", False)
+        self.revive_pose_w = getattr(args, "revive_pose_w", 0.4)  # if you later add OKS
 
     def update(self, output_results, img=None):
         self.frame_id += 1
@@ -184,7 +197,7 @@ class BYTETracker(object):
         inds_low = scores > self.args.track_low_thresh
         inds_high = scores < self.args.track_high_thresh
 
-        inds_second = np.logical_and(inds_low, inds_high)
+        inds_second = np.logical_and(inds_low, inds_high)  ### the second detection is the one that is not high and not low
         dets_second = bboxes_tlwh[inds_second]
         dets = bboxes_tlwh[remain_inds]
         scores_keep = scores[remain_inds]
@@ -202,18 +215,28 @@ class BYTETracker(object):
         tracked_stracks = []  # type: list[STrack]
         for track in self.tracked_stracks:
             if not track.is_activated:
+                # print(f"Adding track {track.track_id} to unconfirmed -=-=-=-")
                 unconfirmed.append(track)
             else:
+                # print(f"Adding track {track.track_id} to tracked_stracks -=-=-=-")
                 tracked_stracks.append(track)
+                
+        # print(f"Strack pool: {len(tracked_stracks)} -=-=-=-")
+        # print(f"Lost stracks: {len(self.lost_stracks)} -=-=-=-")
 
         ''' Step 2: First association, with high score detection boxes'''
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
         # Predict the current location with KF
         STrack.multi_predict(strack_pool)
         dists = iou_distance(strack_pool, detections)
+        # print(f"Distances: {np.array(dists).shape} -=-=-=-")
         if self.args.fuse_score:
             dists = fuse_score(dists, detections)
-        matches, u_track, u_detection = linear_assignment(dists, thresh=self.args.match_thresh)
+        matches, u_track, u_detection = linear_assignment(dists, thresh=self.args.match_thresh)  ## 
+        # print("================================================step 2=================================================")
+        # print(f"Matches: {matches} -=-=-=-")
+        # print(f"Unmatched tracks: {u_track} -=-=-=-")
+        # print(f"Unmatched detections: {u_detection} -=-=-=-")
 
         for itracked, idet in matches:
             track = strack_pool[itracked]
@@ -236,6 +259,11 @@ class BYTETracker(object):
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         dists = iou_distance(r_tracked_stracks, detections_second)
         matches, u_track, u_detection_second = linear_assignment(dists, thresh=0.5)
+        # print("================================================step 3=================================================")
+        # print(f"Distances: {np.array(dists).shape} -=-=-=-")
+        # print(f"Matches: {matches} -=-=-=-")
+        # print(f"Unmatched tracks: {u_track} -=-=-=-")
+        # print(f"Unmatched detections: {u_detection_second} -=-=-=-")
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
             det = detections_second[idet]
@@ -266,16 +294,79 @@ class BYTETracker(object):
             track.mark_removed()
             removed_stracks.append(track)
 
-        """ Step 4: Init new stracks"""
-        for inew in u_detection:
-            track = detections[inew]
-            if track.score < self.args.new_track_thresh:
-                continue
-            track.activate(self.kalman_filter, self.frame_id)
-            activated_starcks.append(track)
+        # """ Step 4: Init new stracks"""
+        # for inew in u_detection:
+        #     track = detections[inew]
+        #     if track.score < self.args.new_track_thresh:
+        #         continue
+        #     track.activate(self.kalman_filter, self.frame_id)
+        #     activated_starcks.append(track)
+        
+        """ Step 4: Init new stracks (revive-first, no new IDs after full init) """
+        if len(u_detection) > 0:
+            cand_dets = [detections[i] for i in u_detection]
+
+            # try to revive lost tracks first - reuse old IDs
+            revived = []
+            still_unmatched = list(range(len(cand_dets)))  # indices into cand_dets
+
+            if self.revive_enable and len(self.lost_stracks) > 0:
+                recent_lost = [t for t in self.lost_stracks
+                            if (self.frame_id - t.end_frame) <= self.revive_max_gap]
+                if len(recent_lost) > 0:
+                    STrack.multi_predict(recent_lost)
+
+                    gate = _maha_gate_tracks_vs_dets(recent_lost, cand_dets, chi2_thr=self.revive_maha_gate)
+                    C_iou = _iou_cost_tracks_vs_dets(recent_lost, cand_dets)
+                    C = np.where(gate, C_iou, 1e3)
+
+                    # (optional) add pose if you later enable it
+                    if self.revive_use_pose:
+                        C_oks = _oks_cost_tracks_vs_dets(recent_lost, cand_dets)
+                        C = (1.0 - self.revive_pose_w) * C + self.revive_pose_w * C_oks
+
+                    matches, u_lost, u_cand = linear_assignment(C, thresh=self.revive_iou_thresh)
+
+                    for ilost, icand in matches:
+                        lt = recent_lost[ilost]
+                        det = cand_dets[icand]
+                        lt.re_activate(det, self.frame_id, new_id=False)  # keep same ID
+                        revived.append(lt)
+                        if icand in still_unmatched:
+                            still_unmatched.remove(icand)
+
+                    if len(revived) > 0:
+                        refind_stracks.extend(revived)
+                        self.lost_stracks = sub_stracks(self.lost_stracks, revived)
+
+            # IMPORTANT: Do NOT create brand-new IDs after full init.
+            # Only fill remaining fixed IDs *before* full init is complete.
+            if not self.full_init and len(self.available_ids) > 0 and len(still_unmatched) > 0:
+                # sort remaining candidates by score desc
+                # (find their original indices in scores_keep if needed; here we sort by det.score)
+                still_unmatched.sort(key=lambda idx: float(cand_dets[idx].score), reverse=True)
+
+                births = []
+                while len(self.available_ids) > 0 and len(still_unmatched) > 0:
+                    idx = still_unmatched.pop(0)
+                    det = cand_dets[idx]
+                    # initialize track then overwrite ID with a fixed one
+                    det.activate(self.kalman_filter, self.frame_id)
+                    det.track_id = self.available_ids.pop(0)
+                    det.is_activated = True
+                    births.append(det)
+                    activated_starcks.append(det)
+
+                # If we just assigned the last fixed ID, lock full_init and block all future births
+                if len(self.available_ids) == 0:
+                    self.full_init = True
+                    self.args.new_track_thresh = float('inf')
+
+        print("======================= lost stracks =========================", len(self.lost_stracks))   
         """ Step 5: Update state"""
         for track in self.lost_stracks:
             if self.frame_id - track.end_frame > self.max_time_lost:
+                # print(f"Marking track {track.track_id} as removed")
                 track.mark_removed()
                 removed_stracks.append(track)
 
@@ -289,9 +380,11 @@ class BYTETracker(object):
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+        print(f"Lost stracks: {len(self.lost_stracks)} , {len(lost_stracks)} -=-=-=-")
         # get scores of lost tracks
         output_stracks = [track for track in self.tracked_stracks if track.is_activated]
 
+        print()
         return output_stracks
 
 
@@ -334,3 +427,70 @@ def remove_duplicate_stracks(stracksa, stracksb):
     resa = [t for i, t in enumerate(stracksa) if not i in dupa]
     resb = [t for i, t in enumerate(stracksb) if not i in dupb]
     return resa, resb
+
+def iou_single(a_tlbr: np.ndarray, b_tlbr: np.ndarray, eps: float = 1e-6) -> float:
+    x1 = max(a_tlbr[0], b_tlbr[0])
+    y1 = max(a_tlbr[1], b_tlbr[1])
+    x2 = min(a_tlbr[2], b_tlbr[2])
+    y2 = min(a_tlbr[3], b_tlbr[3])
+    iw = max(0.0, x2 - x1)
+    ih = max(0.0, y2 - y1)
+    inter = iw * ih
+    a_area = max(0.0, a_tlbr[2] - a_tlbr[0]) * max(0.0, a_tlbr[3] - a_tlbr[1])
+    b_area = max(0.0, b_tlbr[2] - b_tlbr[0]) * max(0.0, b_tlbr[3] - b_tlbr[1])
+    union = a_area + b_area - inter + eps
+    return inter / union
+
+# [REVIVE] Gating against detections (list[STrack]) using track means/covs
+def _maha_gate_tracks_vs_dets(tracks, detections, chi2_thr):
+    T, D = len(tracks), len(detections)
+    if T == 0 or D == 0:
+        return np.zeros((T, D), dtype=bool)
+    det_xy = np.zeros((D, 2), dtype=np.float32)
+    for j, d in enumerate(detections):
+        tlwh = d.tlwh
+        det_xy[j, 0] = tlwh[0] + tlwh[2] * 0.5
+        det_xy[j, 1] = tlwh[1] + tlwh[3] * 0.5
+    gate = np.zeros((T, D), dtype=bool)
+    for i, t in enumerate(tracks):
+        m = t.mean[:2]
+        S = t.covariance[:2, :2]
+        try: Sinv = np.linalg.inv(S)
+        except np.linalg.LinAlgError: Sinv = np.linalg.pinv(S)
+        dxy = det_xy - m[None, :]
+        maha = np.einsum('nd,dd,nd->n', dxy, Sinv, dxy)
+        gate[i, :] = (maha <= chi2_thr)
+    return gate
+
+# [REVIVE] IoU cost between tracks (predicted state already in .mean) and detection STracks
+def _iou_cost_tracks_vs_dets(tracks, detections):
+    T, D = len(tracks), len(detections)
+    if T == 0 or D == 0:
+        return np.zeros((T, D), dtype=np.float32)
+    C = np.ones((T, D), dtype=np.float32)
+    det_tlbr = np.stack([d.tlbr for d in detections], axis=0) if D else None
+    for i, tr in enumerate(tracks):
+        tr_tlbr = tr.tlbr
+        for j in range(D):
+            # cost = 1 - IoU
+            C[i, j] = 1.0 - iou_single(tr_tlbr, det_tlbr[j])
+    return C
+
+# [REVIVE] simple OKS cost (optional) if you later store pose in tracks/dets
+def _oks_cost_tracks_vs_dets(tracks, detections, sigma=0.5):
+    T, D = len(tracks), len(detections)
+    if T == 0 or D == 0:
+        return np.zeros((T, D), dtype=np.float32)
+    C = np.ones((T, D), dtype=np.float32)
+    sig2 = (2.0 * sigma)**2
+    for i, tr in enumerate(tracks):
+        p1 = getattr(tr, "last_pose", None)
+        if p1 is None: continue
+        a1 = max(tr.tlwh[2] * tr.tlwh[3], 1e-6)
+        for j, det in enumerate(detections):
+            p2 = getattr(det, "last_pose", None)
+            if p2 is None or p2.shape != p1.shape: continue
+            dx2 = ((p1 - p2)**2).sum(axis=1)  # (K,)
+            oks = np.exp(-dx2 / (2*a1*sig2 + 1e-6)).mean()
+            C[i, j] = 1.0 - float(oks)
+    return C
