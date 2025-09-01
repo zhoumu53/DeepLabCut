@@ -35,6 +35,7 @@ from deeplabcut.core.trackers.byte_tracker import BYTETracker
 # from byteTrack.trackers.byte_tracker import BYTETracker
 
 from types import SimpleNamespace
+from collections import defaultdict
 
 
 def convert_detections2tracklets(
@@ -199,8 +200,8 @@ def convert_detections2tracklets(
                             
                 ### TODO - make this configurable
                 tracker_args = SimpleNamespace(
-                    track_high_thresh=0.75,      # High confidence threshold
-                    track_low_thresh=0.2,       # Low confidence threshold  
+                    track_high_thresh=0.6,      # High confidence threshold
+                    track_low_thresh=0.3,       # Low confidence threshold  
                     track_buffer=30,            # Number of frames to keep lost tracks
                     match_thresh=0.9,           # Matching threshold for association
                     new_track_thresh=0.5,       # Threshold for creating new tracks
@@ -211,13 +212,25 @@ def convert_detections2tracklets(
                 tracker = BYTETracker(tracker_args, frame_rate=tracker_args.fps)
                     
                 ## TODO - formatting tracklets into the same format as the other tracklets
-                tracklets = track_by_detections(
+                tracklets_by_frame = track_by_detections(
                     detections_data=detections_data,
                     tracker=tracker,
                     num_frames=data["metadata"]["nframes"],
                     video_path=video,
                     output_path=track_filename.with_suffix(".mp4"),
                     fps=tracker_args.fps,
+                )
+                
+                print("joints", data["metadata"]["all_joints_names"])
+                print("scorer", metadata["data"]["Scorer"])
+                print("unique_bodyparts", cfg["uniquebodyparts"])
+                
+                tracklets = build_tracklets_from_results(
+                    tracks_by_frame=tracklets_by_frame,
+                    joints=data["metadata"]["all_joints_names"],
+                    scorer=metadata["data"]["Scorer"],
+                    num_frames=data["metadata"]["nframes"],
+                    ignore_bodyparts=ignore_bodyparts,
                 )
                 
                 with open(track_filename, "wb") as f:
@@ -460,11 +473,124 @@ def track_by_detections(
         # Store results
         all_tracked_results[frame_num] = tracked_objects
         
-        print(f"Frame {frame_num}: {len(tracked_objects)} tracked objects")
+        print(f"Frame {frame_num}: {len(tracked_objects)} tracked objects from {len(results.poses)} detections")
     
     if DEBUG_visualize:
         out.release()
         imageio.mimsave(str(output_path).replace('.mp4', '.gif'), frames, fps=fps)
     
+    
+    print("all_tracked_results", all_tracked_results[0])
     return all_tracked_results
     
+
+def build_tracklets_from_results(
+    tracks_by_frame: dict,
+    joints: list,
+    scorer: str,
+    num_frames: int,
+    pcutoff: float = 0.1,
+    topk: int | None = None,
+    id_order: str = "first_seen",
+    unique_bodyparts: list | None = None,
+    ignore_bodyparts: list | None = None,
+):
+    
+    J = len(joints)
+    ignore_bodyparts = set(ignore_bodyparts or [])
+
+    # -------- count the track_id --------
+    id_stats = defaultdict(lambda: {"first": None, "count": 0})
+    for f, objs in tracks_by_frame.items():
+        for o in objs:
+            tid = int(o.track_id)
+            id_stats[tid]["count"] += 1
+            if id_stats[tid]["first"] is None:
+                id_stats[tid]["first"] = int(f)
+
+    ids = list(id_stats.keys())
+    if id_order == "first_seen":
+        ids.sort(key=lambda t: id_stats[t]["first"])
+    elif id_order == "freq":
+        ids.sort(key=lambda t: (-id_stats[t]["count"], id_stats[t]["first"]))
+    elif id_order == "sorted_id":
+        ids.sort()
+    else:
+        ids.sort(key=lambda t: id_stats[t]["first"])
+
+    if topk is not None:
+        ids = ids[:int(topk)]
+    id_map = {orig: i for i, orig in enumerate(ids)}  # original id -> [0..K-1]
+
+    # -------- initialize the tracklets skeleton --------
+    tracklets = {}
+    tracklets["header"] = _create_tracklets_header(joints, scorer)
+    for i in range(len(ids)):
+        tracklets[i] = {}
+
+    if unique_bodyparts:
+        tracklets["single"] = {}
+
+    # -------- fill the pose (J,3) for each frame --------
+    for f in range(num_frames):
+        objs = tracks_by_frame.get(f)
+        if not objs:
+            continue
+
+        # if there are multiple candidates with the same id in the same frame, 
+        # take the one with the highest score; 
+        # if there is no score, take the one with the highest average keypoint confidence
+        by_id = {}
+        for o in objs:
+            tid = int(o.track_id)
+            if tid not in id_map:
+                continue  # ignore ids that are not in the topk
+            pose = np.asarray(o.last_pose, dtype=np.float32)  # (J,3)
+            if pose.ndim != 2 or pose.shape[0] != J or pose.shape[1] < 2:
+                continue
+
+            cand_score = np.array(o.last_pose_score)  ## (K,1) -> (K,)
+            cand_score = float(np.nanmean(cand_score))
+
+            if tid not in by_id or cand_score > by_id[tid]["_sel_score"]:
+                by_id[tid] = {"pose": pose, "_sel_score": cand_score}
+
+        # write to tracklets
+        for tid, rec in by_id.items():
+            idx = id_map[tid]
+            pose = rec["pose"].copy()
+
+            # pcutoff: low confidence keypoints x,y->NaN
+            if pose.shape[1] >= 3:
+                low = pose[:, 2] < pcutoff
+                pose[low, :2] = np.nan
+            else:
+                # if there is no score, skip the cutoff
+                pass
+
+            # (optional) ignore bodyparts: here we just set NaN, not change the header
+            if ignore_bodyparts:
+                for bname in ignore_bodyparts:
+                    if bname in joints:
+                        j = joints.index(bname)
+                        pose[j, :2] = np.nan
+
+            tracklets[idx][f] = pose
+
+        if unique_bodyparts:
+            best_pose = None
+            best = -1
+            for tid, rec in by_id.items():
+                p = rec["pose"]
+                s = float(np.nanmean(p[:, 2])) if p.shape[1] >= 3 else 0.0
+                if s > best:
+                    best = s
+                    best_pose = p
+            if best_pose is not None:
+                pose_single = best_pose.copy()
+                if pose_single.shape[1] >= 3:
+                    low = pose_single[:, 2] < pcutoff
+                    pose_single[low, :2] = np.nan
+                tracklets["single"][f] = pose_single
+
+    return tracklets

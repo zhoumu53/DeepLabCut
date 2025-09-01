@@ -43,7 +43,7 @@ class DetectionResultsConverter:
     ### map the boxes to the poses
     def map_boxes_to_poses(self):
         boxes2poses = {}
-        for bbox, pose in zip(self.xywh, self.poses):
+        for bbox, pose in zip(self.tlwh, self.poses):
             top_left = bbox[:2].astype(int)
             boxes2poses[tuple(top_left)] = pose
         return boxes2poses
@@ -78,17 +78,21 @@ def _indices_to_matches(cost_matrix, indices, thresh):
 
 
 def linear_assignment(cost_matrix, thresh):
+    """
+    Linear assignment using scipy.optimize.linear_sum_assignment
+    
+    Args:
+        cost_matrix (np.ndarray): Cost matrix of shape (n_tracks, n_detections)
+        thresh (float): Threshold for matching
+        
+    Returns:
+        matches (np.ndarray): Array of shape (n_matches, 2) containing the indices of the matched tracks and detections
+        unmatched_a (tuple): Tuple of indices of unmatched tracks
+        unmatched_b (tuple): Tuple of indices of unmatched detections
+    """
+    
     if cost_matrix.size == 0:
         return np.empty((0, 2), dtype=int), tuple(range(cost_matrix.shape[0])), tuple(range(cost_matrix.shape[1]))
-    
-    # matches, unmatched_a, unmatched_b = [], [], []
-    # cost, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)
-    # for ix, mx in enumerate(x):
-    #     if mx >= 0:
-    #         matches.append([ix, mx])
-    # unmatched_a = np.where(x < 0)[0]
-    # unmatched_b = np.where(y < 0)[0]
-    # matches = np.asarray(matches)
     
     # Use scipy.optimize.linear_sum_assignment
     # https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.linear_sum_assignment.html
