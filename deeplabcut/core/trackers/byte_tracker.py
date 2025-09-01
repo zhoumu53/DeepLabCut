@@ -27,7 +27,7 @@ def xywh2tlwh(x):
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
-    def __init__(self, tlwh, score):
+    def __init__(self, tlwh, score, pose=None, pose_score=None):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float32)
@@ -37,6 +37,9 @@ class STrack(BaseTrack):
 
         self.score = score
         self.tracklet_len = 0
+        
+        self.last_pose = None if pose is None else np.asarray(pose, dtype=np.float32)  # (K,2)
+        self.last_pose_score = None if pose_score is None else np.asarray(pose_score, dtype=np.float32)  # (K,1)
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -82,6 +85,7 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        self.last_pose = new_track.last_pose
 
     def update(self, new_track, frame_id):
         """
@@ -101,6 +105,7 @@ class STrack(BaseTrack):
         self.is_activated = True
 
         self.score = new_track.score
+        self.last_pose = new_track.last_pose
 
     @property
     # @jit(nopython=True)
@@ -179,8 +184,14 @@ class BYTETracker(object):
         self.revive_iou_thresh = getattr(args, "revive_iou_thresh", 0.7)  # cost <= 0.7 -> IoU >= 0.3
         self.revive_maha_gate = getattr(args, "revive_maha_gate", 16.27)  # looser than 9.21
         self.revive_max_gap = getattr(args, "revive_max_gap", self.max_time_lost)
-        self.revive_use_pose = getattr(args, "revive_use_pose", False)
-        self.revive_pose_w = getattr(args, "revive_pose_w", 0.4)  # if you later add OKS
+        self.revive_use_pose = getattr(args, "revive_use_pose", True)
+        self.revive_pose_w = getattr(args, "revive_pose_w", 0.4)
+        
+        # new: init warmup frames
+        self.init_warmup_frames = int(getattr(args, "init_warmup_frames", 3)) 
+        self.init_rank_by = str(getattr(args, "init_rank_by", "x"))
+        self.init_require_hits = int(getattr(args, "init_require_hits", 2))
+        self._warmup_stats = {}
 
     def update(self, output_results, img=None):
         self.frame_id += 1
@@ -192,21 +203,35 @@ class BYTETracker(object):
         scores = output_results.conf
         bboxes = output_results.xywhr if hasattr(output_results, "xywhr") else output_results.xywh
         bboxes_tlwh = output_results.tlwh
+        poses = output_results.poses if hasattr(output_results, "poses") else None  ## (n_individuals, n_keypoints, 2)
+        pose_scores = output_results.pose_scores if hasattr(output_results, "pose_scores") else None  ## (n_individuals, n_keypoints, 1)
 
-        remain_inds = scores >= self.args.track_high_thresh
-        inds_low = scores > self.args.track_low_thresh
-        inds_high = scores < self.args.track_high_thresh
+        # print(f"Pose: {poses} -=-=-=-")
+        # print(f"Pose scores: {pose_scores.shape} -=-=-=-")
+        
+        mask_high = scores >= self.args.track_high_thresh
+        mask_low  = scores >  self.args.track_low_thresh
+        mask_mid  = np.logical_and(mask_low, ~mask_high)
 
-        inds_second = np.logical_and(inds_low, inds_high)  ### the second detection is the one that is not high and not low
-        dets_second = bboxes_tlwh[inds_second]
-        dets = bboxes_tlwh[remain_inds]
-        scores_keep = scores[remain_inds]
-        scores_second = scores[inds_second]
+        no_tracks_yet = (self.frame_id == 1) and (len(self.tracked_stracks) == 0) and (len(self.lost_stracks) == 0)
+        keep_mask = np.logical_or(mask_high, mask_mid) if no_tracks_yet else mask_high
 
+        dets = bboxes_tlwh[keep_mask]
+        scores_keep = scores[keep_mask]
+        poses_keep = poses[keep_mask] if poses is not None else None
+        pose_scores_keep = pose_scores[keep_mask] if pose_scores is not None else None
+
+        dets_second = bboxes_tlwh[mask_mid]
+        scores_second = scores[mask_mid]
+        poses_second = poses[mask_mid] if poses is not None else None
+        pose_scores_second = pose_scores[mask_mid] if pose_scores is not None else None
+        
         if len(dets) > 0:
             '''Detections'''
-            detections = [STrack(tlwh, s) for
-                          (tlwh, s) in zip(dets, scores_keep)]
+            # detections = [STrack(tlwh, s) for
+            #               (tlwh, s) in zip(dets, scores_keep)]
+            detections = [STrack(tlwh, s, pose=(poses_keep[i] if poses_keep is not None else None), pose_score=(pose_scores_keep[i] if pose_scores_keep is not None else None))
+                for i, (tlwh, s) in enumerate(zip(dets, scores_keep))]
         else:
             detections = []
 
@@ -228,10 +253,20 @@ class BYTETracker(object):
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
         # Predict the current location with KF
         STrack.multi_predict(strack_pool)
-        dists = iou_distance(strack_pool, detections)
+        dists_iou = iou_distance(strack_pool, detections)
         # print(f"Distances: {np.array(dists).shape} -=-=-=-")
         if self.args.fuse_score:
-            dists = fuse_score(dists, detections)
+            dists_iou = fuse_score(dists_iou, detections)
+        
+        if self.revive_use_pose:
+            n_bodyparts = detections[0].last_pose.shape[0]
+            pose_sigmas = np.array([0.1]* n_bodyparts)
+            dists_pose = _oks_cost_tracks_vs_dets(strack_pool, detections, sigmas=pose_sigmas)
+            # print(f"Distances pose: {np.array(dists_pose).shape} -=-=-=-")
+            dists = (1.0 - self.revive_pose_w) * dists_iou + self.revive_pose_w * dists_pose
+        else:
+            dists = dists_iou
+            
         matches, u_track, u_detection = linear_assignment(dists, thresh=self.args.match_thresh)  ## 
         # print("================================================step 2=================================================")
         # print(f"Matches: {matches} -=-=-=-")
@@ -252,12 +287,23 @@ class BYTETracker(object):
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(tlwh, s) for
-                          (tlwh, s) in zip(dets_second, scores_second)]
+            detections_second = [STrack(tlwh, s, pose=(poses_second[i] if poses_second is not None else None), pose_score=(pose_scores_second[i] if pose_scores_second is not None else None))
+                                for i, (tlwh, s) in enumerate(zip(dets_second, scores_second))]
+            # detections_second = [STrack(tlwh, s) for
+            #               (tlwh, s) in zip(dets_second, scores_second)]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        dists = iou_distance(r_tracked_stracks, detections_second)
+        # print(f"R tracked stracks: {len(r_tracked_stracks)} -=-=-=-")
+        dists_iou = iou_distance(r_tracked_stracks, detections_second)
+        if self.args.fuse_score:
+            dists_iou = fuse_score(dists_iou, detections_second)
+        
+        if self.revive_use_pose:
+            dists_pose = _oks_cost_tracks_vs_dets(r_tracked_stracks, detections_second, sigmas=pose_sigmas)
+            dists = (1.0 - self.revive_pose_w) * dists_iou + self.revive_pose_w * dists_pose
+        else:
+            dists = dists_iou
         matches, u_track, u_detection_second = linear_assignment(dists, thresh=0.5)
         # print("================================================step 3=================================================")
         # print(f"Distances: {np.array(dists).shape} -=-=-=-")
@@ -265,6 +311,7 @@ class BYTETracker(object):
         # print(f"Unmatched tracks: {u_track} -=-=-=-")
         # print(f"Unmatched detections: {u_detection_second} -=-=-=-")
         for itracked, idet in matches:
+            # print(f"Matching track {itracked} to detection {idet} -=-=-=-")
             track = r_tracked_stracks[itracked]
             det = detections_second[idet]
             if track.state == TrackState.Tracked:
@@ -320,7 +367,6 @@ class BYTETracker(object):
                     C_iou = _iou_cost_tracks_vs_dets(recent_lost, cand_dets)
                     C = np.where(gate, C_iou, 1e3)
 
-                    # (optional) add pose if you later enable it
                     if self.revive_use_pose:
                         C_oks = _oks_cost_tracks_vs_dets(recent_lost, cand_dets)
                         C = (1.0 - self.revive_pose_w) * C + self.revive_pose_w * C_oks
@@ -380,7 +426,7 @@ class BYTETracker(object):
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
-        print(f"Lost stracks: {len(self.lost_stracks)} , {len(lost_stracks)} -=-=-=-")
+        print(f"Lost stracks: {self.lost_stracks} , {len(self.lost_stracks)} -=-=-=-")
         # get scores of lost tracks
         output_stracks = [track for track in self.tracked_stracks if track.is_activated]
 
@@ -476,21 +522,65 @@ def _iou_cost_tracks_vs_dets(tracks, detections):
             C[i, j] = 1.0 - iou_single(tr_tlbr, det_tlbr[j])
     return C
 
-# [REVIVE] simple OKS cost (optional) if you later store pose in tracks/dets
-def _oks_cost_tracks_vs_dets(tracks, detections, sigma=0.5):
+
+def _oks_cost_tracks_vs_dets(tracks, detections, sigmas=None, area_mode="det", eps=1e-6):
+    """
+    OKS cost = 1 - OKS, lower is better.
+    tracks: list[STrack] (pose in track.last_pose)
+    detections: list[STrack] (pose in det.last_pose)
+    sigmas: None | float | np.ndarray with shape (K,)
+    area_mode: "det" | "track" | "min" | "mean"
+    """
     T, D = len(tracks), len(detections)
     if T == 0 or D == 0:
         return np.zeros((T, D), dtype=np.float32)
+
+    # determine K (allow missing poses)
+    K = None
+    for t in tracks:
+        if getattr(t, "last_pose", None) is not None:
+            K = t.last_pose.shape[0]; break
+    if K is None:
+        for d in detections:
+            if getattr(d, "last_pose", None) is not None:
+                K = d.last_pose.shape[0]; break
+    if K is None:
+        return np.ones((T, D), dtype=np.float32)  # no pose anywhere → neutral high cost
+
+    if sigmas is None:
+        sigmas = 0.05  # a reasonable default; tune per dataset
+    if np.isscalar(sigmas):
+        sig = float(sigmas)
+        sig_vec = np.full((K,), sig, dtype=np.float32)
+    else:
+        sig_vec = np.asarray(sigmas, dtype=np.float32).reshape(-1)
+        if sig_vec.shape[0] != K:
+            raise ValueError(f"sigmas length {sig_vec.shape[0]} != K {K}")
+    sig2 = (2.0 * sig_vec)**2  # shape (K,)
+
     C = np.ones((T, D), dtype=np.float32)
-    sig2 = (2.0 * sigma)**2
     for i, tr in enumerate(tracks):
         p1 = getattr(tr, "last_pose", None)
-        if p1 is None: continue
-        a1 = max(tr.tlwh[2] * tr.tlwh[3], 1e-6)
+        if p1 is None or p1.shape[0] != K:
+            continue
+        a_tr = max(tr.tlwh[2] * tr.tlwh[3], eps)
         for j, det in enumerate(detections):
             p2 = getattr(det, "last_pose", None)
-            if p2 is None or p2.shape != p1.shape: continue
-            dx2 = ((p1 - p2)**2).sum(axis=1)  # (K,)
-            oks = np.exp(-dx2 / (2*a1*sig2 + 1e-6)).mean()
-            C[i, j] = 1.0 - float(oks)
+            if p2 is None or p2.shape[0] != K:
+                continue
+            a_det = max(det.tlwh[2] * det.tlwh[3], eps)
+            if area_mode == "det":
+                a = a_det
+            elif area_mode == "track":
+                a = a_tr
+            elif area_mode == "min":
+                a = min(a_tr, a_det)
+            else:
+                a = 0.5 * (a_tr + a_det)
+
+            # per-keypoint squared distance
+            dx2 = ((p1 - p2) ** 2).sum(axis=1).astype(np.float32)  # (K,)
+            oks_per_k = np.exp(-dx2 / (2.0 * a * sig2 + eps))      # (K,)
+            oks = float(oks_per_k.mean())
+            C[i, j] = 1.0 - oks
     return C
