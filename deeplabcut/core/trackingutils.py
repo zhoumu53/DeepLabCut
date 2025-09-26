@@ -32,6 +32,7 @@ TRACK_METHODS = {
     "skeleton": "_sk",
     "ellipse": "_el",
     "transformer": "_tr",
+    "byteTrack": "_bx_byteTrack",
 }
 
 

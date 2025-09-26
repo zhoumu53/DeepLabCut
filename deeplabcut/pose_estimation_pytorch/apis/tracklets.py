@@ -176,7 +176,7 @@ def convert_detections2tracklets(
                     unique_bodyparts=cfg["uniquebodyparts"],
                     identity_only=identity_only
                 )
-
+                
                 with open(track_filename, "wb") as f:
                     pickle.dump(tracklets, f, pickle.HIGHEST_PROTOCOL)
             else:
@@ -211,8 +211,8 @@ def convert_detections2tracklets(
                 )
                 tracker = BYTETracker(tracker_args, frame_rate=tracker_args.fps)
                     
-                ## TODO - formatting tracklets into the same format as the other tracklets
-                tracklets_by_frame = track_by_detections(
+                ## formatting tracklets into the same format as the other tracklets
+                tracklets = track_by_detections(
                     detections_data=detections_data,
                     tracker=tracker,
                     num_frames=data["metadata"]["nframes"],
@@ -221,24 +221,26 @@ def convert_detections2tracklets(
                     fps=tracker_args.fps,
                 )
                 
-                print("joints", data["metadata"]["all_joints_names"])
-                print("scorer", metadata["data"]["Scorer"])
-                print("unique_bodyparts", cfg["uniquebodyparts"])
-                
-                tracklets = build_tracklets_from_results(
-                    tracks_by_frame=tracklets_by_frame,
-                    joints=data["metadata"]["all_joints_names"],
-                    scorer=metadata["data"]["Scorer"],
-                    num_frames=data["metadata"]["nframes"],
-                    ignore_bodyparts=ignore_bodyparts,
-                )
+                tracklets["header"] = _create_tracklets_header(data["metadata"]["all_joints_names"], 
+                                                               metadata["data"]["Scorer"])
                 
                 with open(track_filename, "wb") as f:
                     pickle.dump(tracklets, f, pickle.HIGHEST_PROTOCOL)
-                ## TODO: format the tracklets + save to h5 file
-                print("saved to", track_filename)
                 
+                # Get individuals from the config
+                individuals = cfg.get("individuals", [""])
+                
+                h5_filename = str(track_filename).replace(".pickle", ".h5")
+                df_tracking = convert_tracklets_to_h5(tracklets, 
+                                                    data["metadata"]["nframes"],
+                                                    individuals,
+                                                    joints=data["metadata"]["all_joints_names"],
+                                                    scorer=metadata["data"]["Scorer"])
+                
+                
+                df_tracking.to_hdf(h5_filename, key="df_with_missing", mode="w", format="table")
 
+    
     os.chdir(str(start_path))
     if track_method == "byteTrack":
         return
@@ -405,12 +407,10 @@ def track_by_detections(
     detections_data: dict,
     tracker: BYTETracker,
     num_frames: int,
-    # ignore_bodyparts: list[str]|None = None,
-    # unique_bodyparts: list|None = None,
-    # identity_only: bool = False,
     output_path: str = None,
     fps: int = 30,
     video_path: str = None,
+    DEBUG_visualize: bool = False
 ):
     
     
@@ -422,7 +422,7 @@ def track_by_detections(
         pose_scores = results['confidence']
         return bboxes, bbox_scores, poses, pose_scores
 
-    DEBUG_visualize = True
+    
     if DEBUG_visualize:
         import decord
         import cv2
@@ -435,23 +435,37 @@ def track_by_detections(
         # Setup video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-    frames = []
-    all_tracked_results = {}
+        frames = []
+    
+    track_id_results = {}
     
     num_frames = len(detections_data)
     for frame_num in range(0, num_frames):
+        
+        frame_name = 'frame' + str(frame_num).zfill(int(np.ceil(np.log10(num_frames))))
         # Extract detection results for current frame
         bboxes, bbox_scores, poses, pose_scores = extract_frame_results(detections_data, frame_num)
 
         # Convert to tracker format
         results = DetectionResultsConverter(bboxes, bbox_scores, poses, pose_scores)
-        
+                        
         img = vr[frame_num].asnumpy() if vr is not None else None
 
         # Update tracker with current frame detections
-        tracked_objects = tracker.update(results, img=img)
-                
+        tracked_objects = tracker.update(results, img=img)        
+        
+        for i, obj in enumerate(tracked_objects):
+            track_id = int(obj.track_id)
+            if track_id not in track_id_results:
+                track_id_results[track_id] = {}
+            
+            pose_w_score = np.zeros((obj.last_pose.shape[0], 4), dtype=np.float32)
+            pose_w_score[:, :2] = obj.last_pose
+            pose_w_score[:, 2] = obj.last_pose_score[:, 0] if obj.last_pose_score.ndim == 2 else obj.last_pose_score
+            pose_w_score[:, 3] = -1
+            track_id_results[track_id][frame_name] = pose_w_score
+        ###
+        
         if DEBUG_visualize:
             # Visualize the results
             from byteTrack.trackers.dlc_converter import visualize_tracking
@@ -469,128 +483,107 @@ def track_by_detections(
                 print("saved to", str(output_path).replace('.mp4', f'_{frame_num}.png'))
             
             out.write(vis_image)
-            
-        # Store results
-        all_tracked_results[frame_num] = tracked_objects
-        
-        print(f"Frame {frame_num}: {len(tracked_objects)} tracked objects from {len(results.poses)} detections")
-    
+
     if DEBUG_visualize:
         out.release()
         imageio.mimsave(str(output_path).replace('.mp4', '.gif'), frames, fps=fps)
     
     
-    print("all_tracked_results", all_tracked_results[0])
-    return all_tracked_results
+    return track_id_results
     
 
-def build_tracklets_from_results(
-    tracks_by_frame: dict,
-    joints: list,
-    scorer: str,
-    num_frames: int,
-    pcutoff: float = 0.1,
-    topk: int | None = None,
-    id_order: str = "first_seen",
-    unique_bodyparts: list | None = None,
-    ignore_bodyparts: list | None = None,
-):
+def convert_tracklets_to_h5(tracklets: dict, 
+                            total_frames: int,
+                            individuals: list,
+                            joints: list,
+                            scorer: str) -> pd.DataFrame:
+    """Convert tracklets dictionary to a pandas DataFrame and save as h5 file."""
+    header = tracklets['header']
+
+    try:
+        coords = list(pd.unique(header.get_level_values("coords")))
+    except:
+        coords = list(pd.unique(header.get_level_values(2)))
     
-    J = len(joints)
-    ignore_bodyparts = set(ignore_bodyparts or [])
+    import re
+    # --- Individuals present in tracklets: numeric keys 0,1,2,... mapped to provided names ---
+    ind_keys = sorted([k for k in tracklets.keys() if isinstance(k, int)])
+    if not ind_keys:
+        raise ValueError("No numeric individual keys (0,1,2,...) found in `tracklets`.")
+    if individuals is None:
+        individuals = [f"id{k}" for k in ind_keys]
+    if len(individuals) != len(ind_keys):
+        raise ValueError("`individuals` length must match number of numeric individual keys in `tracklets`.")
 
-    # -------- count the track_id --------
-    id_stats = defaultdict(lambda: {"first": None, "count": 0})
-    for f, objs in tracks_by_frame.items():
-        for o in objs:
-            tid = int(o.track_id)
-            id_stats[tid]["count"] += 1
-            if id_stats[tid]["first"] is None:
-                id_stats[tid]["first"] = int(f)
+    # --- Build per-individual {int_frame_id -> array} maps; accept 'frameXX' or int keys ---
+    def key_to_int(k):
+        if isinstance(k, int):
+            return k
+        m = re.search(r"\d+", str(k))
+        if not m:
+            raise ValueError(f"Cannot extract frame number from key: {k!r}")
+        return int(m.group())
 
-    ids = list(id_stats.keys())
-    if id_order == "first_seen":
-        ids.sort(key=lambda t: id_stats[t]["first"])
-    elif id_order == "freq":
-        ids.sort(key=lambda t: (-id_stats[t]["count"], id_stats[t]["first"]))
-    elif id_order == "sorted_id":
-        ids.sort()
+    per_ind_maps = []
+    all_frame_ids = set()
+    for k in ind_keys:
+        frames_dict = tracklets[k]
+        f_map = {}
+        for fk, arr in frames_dict.items():
+            fid = key_to_int(fk)
+            f_map[fid] = np.asarray(arr)
+            all_frame_ids.add(fid)
+        per_ind_maps.append(f_map)
+        
+
+    # --- Decide integer frame index order ---
+    if total_frames is not None and total_frames > 0:
+        frame_ids = list(range(total_frames))
     else:
-        ids.sort(key=lambda t: id_stats[t]["first"])
+        frame_ids = sorted(all_frame_ids)
+    index = pd.Index(frame_ids, name=None)
 
-    if topk is not None:
-        ids = ids[:int(topk)]
-    id_map = {orig: i for i, orig in enumerate(ids)}  # original id -> [0..K-1]
+    n_frames = len(frame_ids)
+    n_bp = len(joints)
+    n_c = len(coords)
 
-    # -------- initialize the tracklets skeleton --------
-    tracklets = {}
-    tracklets["header"] = _create_tracklets_header(joints, scorer)
-    for i in range(len(ids)):
-        tracklets[i] = {}
+    # --- Assemble blocks per individual in order of provided `individuals` ---
+    blocks = []
+    col_blocks = []
+    for ind_name, f_map in zip(individuals, per_ind_maps):
+        # (n_frames, n_bp, n_c) filled with NaN
+        cube = np.full((n_frames, n_bp, n_c), np.nan, dtype=float)
 
-    if unique_bodyparts:
-        tracklets["single"] = {}
-
-    # -------- fill the pose (J,3) for each frame --------
-    for f in range(num_frames):
-        objs = tracks_by_frame.get(f)
-        if not objs:
-            continue
-
-        # if there are multiple candidates with the same id in the same frame, 
-        # take the one with the highest score; 
-        # if there is no score, take the one with the highest average keypoint confidence
-        by_id = {}
-        for o in objs:
-            tid = int(o.track_id)
-            if tid not in id_map:
-                continue  # ignore ids that are not in the topk
-            pose = np.asarray(o.last_pose, dtype=np.float32)  # (J,3)
-            if pose.ndim != 2 or pose.shape[0] != J or pose.shape[1] < 2:
+        for i, fid in enumerate(frame_ids):
+            if fid not in f_map:
                 continue
+            A = f_map[fid]
+            if A.ndim != 2 or A.shape[0] != n_bp or A.shape[1] < 3:
+                raise ValueError(
+                    f"Frame {fid} for individual '{ind_name}' has shape {A.shape}; "
+                    f"expected (n_bodyparts={n_bp}, >=3)."
+                )
+            # Take first 3 columns as (x,y,likelihood) or whatever header coords order is.
+            # If your arrays are in a different order, remap here to match `coords`.
+            A3 = A[:, :3]
+            if A3.shape[1] != n_c:
+                raise ValueError(
+                    f"Coord count/order mismatch: data cols={A3.shape[1]}, header coords={coords}"
+                )
+            cube[i] = A3
 
-            cand_score = np.array(o.last_pose_score)  ## (K,1) -> (K,)
-            cand_score = float(np.nanmean(cand_score))
+        blocks.append(cube.reshape(n_frames, n_bp * n_c))
+        col_blocks.append(
+            pd.MultiIndex.from_product(
+                [[scorer], [ind_name], joints, coords],
+                names=["scorer", "individuals", "bodyparts", "coords"],
+            )
+        )
 
-            if tid not in by_id or cand_score > by_id[tid]["_sel_score"]:
-                by_id[tid] = {"pose": pose, "_sel_score": cand_score}
-
-        # write to tracklets
-        for tid, rec in by_id.items():
-            idx = id_map[tid]
-            pose = rec["pose"].copy()
-
-            # pcutoff: low confidence keypoints x,y->NaN
-            if pose.shape[1] >= 3:
-                low = pose[:, 2] < pcutoff
-                pose[low, :2] = np.nan
-            else:
-                # if there is no score, skip the cutoff
-                pass
-
-            # (optional) ignore bodyparts: here we just set NaN, not change the header
-            if ignore_bodyparts:
-                for bname in ignore_bodyparts:
-                    if bname in joints:
-                        j = joints.index(bname)
-                        pose[j, :2] = np.nan
-
-            tracklets[idx][f] = pose
-
-        if unique_bodyparts:
-            best_pose = None
-            best = -1
-            for tid, rec in by_id.items():
-                p = rec["pose"]
-                s = float(np.nanmean(p[:, 2])) if p.shape[1] >= 3 else 0.0
-                if s > best:
-                    best = s
-                    best_pose = p
-            if best_pose is not None:
-                pose_single = best_pose.copy()
-                if pose_single.shape[1] >= 3:
-                    low = pose_single[:, 2] < pcutoff
-                    pose_single[low, :2] = np.nan
-                tracklets["single"][f] = pose_single
-
-    return tracklets
+    # --- Concatenate into final DF (scorer, individuals, bodyparts, coords); integer index ---
+    columns = col_blocks[0].append(col_blocks[1:]) if len(col_blocks) > 1 else col_blocks[0]
+    values = np.concatenate(blocks, axis=1) if len(blocks) > 1 else blocks[0]
+    df = pd.DataFrame(values, index=index, columns=columns)
+    return df
+    
+    

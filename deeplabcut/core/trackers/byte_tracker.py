@@ -201,7 +201,6 @@ class BYTETracker(object):
         removed_stracks = []
         
         scores = output_results.conf
-        bboxes = output_results.xywhr if hasattr(output_results, "xywhr") else output_results.xywh
         bboxes_tlwh = output_results.tlwh
         poses = output_results.poses if hasattr(output_results, "poses") else None  ## (n_individuals, n_keypoints, 2)
         pose_scores = output_results.pose_scores if hasattr(output_results, "pose_scores") else None  ## (n_individuals, n_keypoints, 1)

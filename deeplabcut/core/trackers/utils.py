@@ -23,7 +23,6 @@ class DetectionResultsConverter:
         self.pose_scores = np.array(pose_scores)  ## pose_scores: [n_individuals, n_keypoints, 1]
 
         self.cls = classes if classes is not None else np.zeros(len(scores))
-        self.boxes2poses = self.map_boxes_to_poses()
         
     def tlwh2xywh(self, bboxes):
         """
@@ -40,14 +39,6 @@ class DetectionResultsConverter:
         center_point = top_left + bboxes[:, 2:4]/2
         return np.concatenate([center_point, bboxes[:, 2:4]], axis=1)
         
-    ### map the boxes to the poses
-    def map_boxes_to_poses(self):
-        boxes2poses = {}
-        for bbox, pose in zip(self.tlwh, self.poses):
-            top_left = bbox[:2].astype(int)
-            boxes2poses[tuple(top_left)] = pose
-        return boxes2poses
-
 
 def merge_matches(m1, m2, shape):
     O,P,Q = shape
