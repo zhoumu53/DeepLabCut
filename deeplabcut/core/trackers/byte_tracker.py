@@ -408,7 +408,7 @@ class BYTETracker(object):
                     self.full_init = True
                     self.args.new_track_thresh = float('inf')
 
-        print("======================= lost stracks =========================", len(self.lost_stracks))   
+        # print("======================= lost stracks =========================", len(self.lost_stracks))   
         """ Step 5: Update state"""
         for track in self.lost_stracks:
             if self.frame_id - track.end_frame > self.max_time_lost:
@@ -426,11 +426,11 @@ class BYTETracker(object):
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
         self.removed_stracks.extend(removed_stracks)
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
-        print(f"Lost stracks: {self.lost_stracks} , {len(self.lost_stracks)} -=-=-=-")
+        # print(f"Lost stracks: {self.lost_stracks} , {len(self.lost_stracks)} -=-=-=-")
         # get scores of lost tracks
         output_stracks = [track for track in self.tracked_stracks if track.is_activated]
 
-        print()
+        # print()
         return output_stracks
 
 
